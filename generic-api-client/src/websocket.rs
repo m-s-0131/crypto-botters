@@ -1,28 +1,62 @@
-use std::{
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
-    collections::hash_map::{HashMap, Entry},
-    time::Duration,
-    mem,
-};
-use tokio::{
-    sync::{mpsc as tokio_mpsc, Mutex as AsyncMutex, Notify},
-    task::JoinHandle,
-    net::TcpStream,
-    time::{MissedTickBehavior, timeout},
-};
-use tokio_tungstenite::{
-    tungstenite,
-    MaybeTlsStream,
-};
-pub use tungstenite::Error as TungsteniteError;
 use futures_util::{
     sink::SinkExt,
-    stream::{StreamExt, SplitSink},
+    stream::{SplitSink, StreamExt},
 };
 use parking_lot::Mutex as SyncMutex;
+use std::{
+    collections::hash_map::{Entry, HashMap},
+    collections::VecDeque,
+    mem,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc as tokio_mpsc, Mutex as AsyncMutex, Notify},
+    task::JoinHandle,
+    time::{timeout, MissedTickBehavior},
+};
+use tokio_tungstenite::{tungstenite, MaybeTlsStream};
+use tungstenite::client::IntoClientRequest;
+pub use tungstenite::Error as TungsteniteError;
 
 type WebSocketStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WebSocketSplitSink = SplitSink<WebSocketStream, tungstenite::Message>;
+
+#[derive(Debug)]
+struct ActiveSink {
+    // 現在この sink が紐づいている接続ID（true/false の2値）。
+    // 再接続で sink が差し替わるときに id も同時に差し替えることで、
+    // 「どの接続に送ったか」と送信履歴の紐付けをズラさない。
+    id: bool,
+    sink: WebSocketSplitSink,
+}
+
+// WebSocket の下にある実体は TCP(Plain/TLS) なので、そこから local/peer addr を取り出して
+// 「どの TCP 接続でエラーが起きたか」をログに出せるようにする。
+fn socket_addrs_from_stream(
+    stream: &MaybeTlsStream<TcpStream>,
+) -> (Option<SocketAddr>, Option<SocketAddr>) {
+    let tcp_stream = match stream {
+        MaybeTlsStream::Plain(tcp_stream) => Some(tcp_stream),
+        #[cfg(feature = "native-tls")]
+        MaybeTlsStream::NativeTls(tls_stream) => Some(tls_stream.get_ref().get_ref().get_ref()),
+        #[cfg(any(
+            feature = "rustls-tls-native-roots",
+            feature = "rustls-tls-webpki-roots"
+        ))]
+        MaybeTlsStream::Rustls(tls_stream) => Some(tls_stream.get_ref().0),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    };
+    tcp_stream.map_or((None, None), |tcp_stream| {
+        (tcp_stream.local_addr().ok(), tcp_stream.peer_addr().ok())
+    })
+}
 
 /// A `struct` that holds a websocket connection.
 ///
@@ -41,7 +75,7 @@ type WebSocketSplitSink = SplitSink<WebSocketStream, tungstenite::Message>;
 #[must_use = "dropping WebSocketConnection closes the connection"]
 pub struct WebSocketConnection<H: WebSocketHandler> {
     task_reconnect: JoinHandle<()>,
-    sink: Arc<AsyncMutex<WebSocketSplitSink>>,
+    sink: Arc<AsyncMutex<ActiveSink>>,
     inner: Arc<ConnectionInner<H>>,
     reconnect_state: ReconnectState,
 }
@@ -63,10 +97,84 @@ pub struct WebSocketConnection<H: WebSocketHandler> {
 //     4. feed_handler receives the message, but ignores it because it is from the old connection
 #[derive(Debug)]
 struct ConnectionInner<H: WebSocketHandler> {
-    url: String,
+    base_url: String,
     handler: Arc<SyncMutex<H>>,
     message_tx: tokio_mpsc::UnboundedSender<(bool, FeederMessage)>,
     next_connection_id: AtomicBool,
+    // 接続試行ごとのメタ情報を conn_id(bool) で保持する。
+    // 再接続が発生すると conn_id がトグルされ、古い接続の情報と区別できる。
+    attempt_info: SyncMutex<HashMap<bool, ConnectionAttemptInfo>>,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionAttemptInfo {
+    // 実際に接続した URL（url_prefix を含む完全な URL）。
+    url: String,
+    // どのローカルポート/宛先に繋がっていたか（TCPレベル）。
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
+    // その接続(conn_id)で送ったメッセージの要約履歴（直近 N 件）。
+    // subscribe/auth の内容を「どの接続が送っていたか」追跡する目的。
+    sent_messages: VecDeque<String>,
+}
+
+impl ConnectionAttemptInfo {
+    // ログに載せる送信履歴の最大件数（多すぎるとログが爆発するため上限を設ける）。
+    const SENT_HISTORY_LIMIT: usize = 50;
+
+    // ログ用にメッセージを短く要約する。
+    // Text は先頭だけ、Binary/Ping/Pong は長さのみ。
+    fn summarize_message(message: &WebSocketMessage) -> String {
+        match message {
+            WebSocketMessage::Text(text) => {
+                // 送信メッセージには auth 情報（APIキー/署名/トークン等）が含まれ得る。
+                // それを error ログ等に載せると漏洩するので、怪しい文字列が含まれる場合は本文を出さない。
+                let lower = text.to_ascii_lowercase();
+                let looks_sensitive = [
+                    "api_key",
+                    "apikey",
+                    "api-secret",
+                    "apisecret",
+                    "secret",
+                    "signature",
+                    "passphrase",
+                    "token",
+                ]
+                .into_iter()
+                .any(|needle| lower.contains(needle));
+                if looks_sensitive {
+                    return format!("Text(len={}, redacted=true)", text.len());
+                }
+                const LIMIT_BYTES: usize = 256;
+                let mut end = std::cmp::min(text.len(), LIMIT_BYTES);
+                while !text.is_char_boundary(end) {
+                    end = end.saturating_sub(1);
+                }
+                let prefix = &text[..end];
+                if end == text.len() {
+                    format!("Text({prefix})")
+                } else {
+                    format!("Text({prefix}…)")
+                }
+            }
+            WebSocketMessage::Binary(data) => format!("Binary(len={})", data.len()),
+            WebSocketMessage::Ping(data) => format!("Ping(len={})", data.len()),
+            WebSocketMessage::Pong(data) => format!("Pong(len={})", data.len()),
+        }
+    }
+
+    // 送信履歴に追加（リングバッファ）。
+    fn record_sent(&mut self, message: &WebSocketMessage) {
+        if self.sent_messages.len() >= Self::SENT_HISTORY_LIMIT {
+            self.sent_messages.pop_front();
+        }
+        self.sent_messages
+            .push_back(Self::summarize_message(message));
+    }
+
+    fn sent_messages_snapshot(&self) -> Vec<String> {
+        self.sent_messages.iter().cloned().collect()
+    }
 }
 
 enum FeederMessage {
@@ -80,16 +188,17 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
     pub async fn new(url: &str, handler: H) -> Result<Self, TungsteniteError> {
         let config = handler.websocket_config();
         let handler = Arc::new(SyncMutex::new(handler));
-        let url = config.url_prefix.clone() + url;
+        let base_url = url.to_owned();
 
         let (message_tx, message_rx) = tokio_mpsc::unbounded_channel();
         let reconnect_manager = ReconnectState::new();
 
         let connection = Arc::new(ConnectionInner {
-            url,
+            base_url,
             handler: Arc::clone(&handler),
             message_tx,
             next_connection_id: AtomicBool::new(false),
+            attempt_info: SyncMutex::new(HashMap::new()),
         });
 
         async fn feed_handler(
@@ -97,7 +206,7 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
             mut message_rx: tokio_mpsc::UnboundedReceiver<(bool, FeederMessage)>,
             reconnect_manager: ReconnectState,
             config: WebSocketConfig,
-            sink: Arc<AsyncMutex<WebSocketSplitSink>>,
+            sink: Arc<AsyncMutex<ActiveSink>>,
         ) {
             let mut messages: HashMap<WebSocketMessage, isize> = HashMap::new();
 
@@ -115,11 +224,7 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
                         if let Some(message) = WebSocketMessage::from_message(message) {
                             if reconnect_manager.is_reconnecting() {
                                 // reconnecting
-                                let id_sign: isize = if id {
-                                    1
-                                } else {
-                                    -1
-                                };
+                                let id_sign: isize = if id { 1 } else { -1 };
                                 let entry = messages.entry(message.clone());
                                 match entry {
                                     Entry::Occupied(mut occupied) => {
@@ -135,7 +240,7 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
                                             continue;
                                         }
                                         // comes from the same connection, which means the message was sent twice.
-                                    },
+                                    }
                                     Entry::Vacant(vacant) => {
                                         // new message
                                         vacant.insert(id_sign);
@@ -145,31 +250,76 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
                                 messages.clear();
                             }
                             let messages = connection.handler.lock().handle_message(message);
+                            // handler が「返信として送りたい」メッセージ（例: auth成功後の subscribe）を返すことがある。
+                            // その場合も「この接続(conn_id)で何を送ったか」を追えるよう履歴に残す。
                             let mut sink_lock = sink.lock().await;
+                            let current_id = sink_lock.id;
                             for message in messages {
-                                if let Err(error) = sink_lock.send(message.into_message()).await {
-                                    log::error!("Failed to send message because of an error: {}", error);
+                                if let Some(attempt) =
+                                    connection.attempt_info.lock().get_mut(&current_id)
+                                {
+                                    attempt.record_sent(&message);
+                                }
+                                if let Err(error) =
+                                    sink_lock.sink.send(message.into_message()).await
+                                {
+                                    log::error!(
+                                        "Failed to send message because of an error: {}",
+                                        error
+                                    );
                                 };
                             }
-                            if let Err(error) = sink_lock.flush().await {
-                                log::error!("An error occurred while flushing WebSocket sink: {error:?}");
+                            if let Err(error) = sink_lock.sink.flush().await {
+                                log::error!(
+                                    "An error occurred while flushing WebSocket sink: {error:?}"
+                                );
                             }
                         }
-                    },
+                    }
                     // failed to receive message
-                    Ok(Some((_, FeederMessage::Message(Err(error))))) => {
-                        log::error!("Failed to receive message because of an error: {error:?}");
+                    Ok(Some((id, FeederMessage::Message(Err(error))))) => {
+                        let current_id = !connection.next_connection_id.load(Ordering::SeqCst);
+                        let attempt = connection.attempt_info.lock().get(&id).cloned();
+                        let (local_addr, peer_addr, sent_messages, url) = attempt
+                            .as_ref()
+                            .map(|attempt| {
+                                (
+                                    attempt.local_addr,
+                                    attempt.peer_addr,
+                                    attempt.sent_messages_snapshot(),
+                                    attempt.url.as_str(),
+                                )
+                            })
+                            .unwrap_or((None, None, Vec::new(), connection.base_url.as_str()));
+                        if id != current_id {
+                            // 再接続中は古い接続の read loop からもエラーが飛んでくることがあるので、
+                            // それで現在の接続を誤って再接続させないよう「古い接続のエラー」は詳細だけ debug にして無視する。
+                            log::debug!(
+                                "WebSocket receive error from old connection; url={} local_addr={local_addr:?} peer_addr={peer_addr:?} conn_id={} current_id={} sent_messages={sent_messages:?} error={error:?}",
+                                url,
+                                id,
+                                current_id,
+                            );
+                            continue;
+                        }
+                        // 「どの TCP 接続(local/peer)で」「何を送っていたか(sent_messages)」を一緒に出す。
+                        log::error!(
+                            "Failed to receive message because of an error; url={} local_addr={local_addr:?} peer_addr={peer_addr:?} conn_id={} reconnecting={} sent_messages={sent_messages:?} error={error:?}",
+                            url,
+                            id,
+                            reconnect_manager.is_reconnecting(),
+                        );
                         if reconnect_manager.request_reconnect() {
                             log::info!("Reconnecting WebSocket because there was an error while receiving a message");
                         }
-                    },
+                    }
                     // timeout
                     Err(_) => {
                         log::debug!("WebSocket message timeout");
                         if reconnect_manager.request_reconnect() {
                             log::info!("Reconnecting WebSocket because of timeout");
                         }
-                    },
+                    }
                     // connection was closed
                     Ok(Some((id, FeederMessage::ConnectionClosed))) => {
                         let current_id = !connection.next_connection_id.load(Ordering::SeqCst);
@@ -179,12 +329,23 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
                         }
                         log::debug!("WebSocket connection closed by server");
                         if reconnect_manager.request_reconnect() {
-                            log::info!("Reconnecting WebSocket because it was disconnected by the server");
+                            let attempt = connection.attempt_info.lock().get(&id).cloned();
+                            let (sent_messages, url) = attempt
+                                .as_ref()
+                                .map(|attempt| {
+                                    (attempt.sent_messages_snapshot(), attempt.url.as_str())
+                                })
+                                .unwrap_or((Vec::new(), connection.base_url.as_str()));
+                            log::info!(
+                                "Reconnecting WebSocket because it was disconnected by the server; url={} conn_id={} sent_messages={sent_messages:?}",
+                                url,
+                                id,
+                            );
                         }
-                    },
+                    }
                     // the connection is no longer needed because WebSocketConnection was dropped
                     Ok(Some((_, FeederMessage::DropConnectionRequest))) => {
-                        if let Err(error) = sink.lock().await.close().await {
+                        if let Err(error) = sink.lock().await.sink.close().await {
                             log::debug!("Failed to close WebSocket connection: {error:?}");
                         }
                         break;
@@ -200,7 +361,7 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
             interval: Duration,
             cooldown: Duration,
             connection: Arc<ConnectionInner<H>>,
-            sink: Arc<AsyncMutex<WebSocketSplitSink>>,
+            sink: Arc<AsyncMutex<ActiveSink>>,
             reconnect_manager: ReconnectState,
             no_duplicate: bool,
             wait: Duration,
@@ -220,7 +381,10 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
                 }
                 log::debug!("Reconnection requested");
                 cooldown.tick().await;
-                reconnect_manager.inner.reconnecting.store(true, Ordering::SeqCst);
+                reconnect_manager
+                    .inner
+                    .reconnecting
+                    .store(true, Ordering::SeqCst);
 
                 // reconnect_notify might have been notified while waiting the cooldown,
                 // so we consume any existing permits on reconnect_notify
@@ -244,24 +408,33 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
                             tokio::time::sleep(wait).await;
                         }
 
-                        if let Err(error) = old_sink.close().await {
-                            log::debug!("An error occurred while closing old connection: {}", error);
+                        if let Err(error) = old_sink.sink.close().await {
+                            log::debug!(
+                                "An error occurred while closing old connection: {}",
+                                error
+                            );
                         }
                         connection.handler.lock().handle_close(true);
                         log::debug!("Old connection closed");
-                    },
+                    }
                     Err(error) => {
                         // try reconnecting again
-                        log::error!("Failed to reconnect because of an error: {}, trying again ...", error);
+                        log::error!(
+                            "Failed to reconnect because of an error: {}, trying again ...",
+                            error
+                        );
                         reconnect_manager.inner.reconnect_notify.notify_one();
-                    },
+                    }
                 }
 
                 if no_duplicate {
                     tokio::time::sleep(wait).await;
                 }
 
-                reconnect_manager.inner.reconnecting.store(false, Ordering::SeqCst);
+                reconnect_manager
+                    .inner
+                    .reconnecting
+                    .store(false, Ordering::SeqCst);
                 log::debug!("Reconnection process complete");
             }
         }
@@ -269,15 +442,13 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
         let sink_inner = Self::start_connection(Arc::clone(&connection)).await?;
         let sink = Arc::new(AsyncMutex::new(sink_inner));
 
-        tokio::spawn(
-            feed_handler(
-                Arc::clone(&connection),
-                message_rx,
-                reconnect_manager.clone(),
-                config.clone(),
-                Arc::clone(&sink),
-            )
-        );
+        tokio::spawn(feed_handler(
+            Arc::clone(&connection),
+            message_rx,
+            reconnect_manager.clone(),
+            config.clone(),
+            Arc::clone(&sink),
+        ));
 
         let task_reconnect = tokio::spawn(reconnect(
             config.refresh_after,
@@ -297,24 +468,138 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
         })
     }
 
-    async fn start_connection(connection: Arc<ConnectionInner<impl WebSocketHandler>>) -> Result<WebSocketSplitSink, TungsteniteError> {
-        let (websocket_stream, _) = tokio_tungstenite::connect_async(connection.url.clone()).await?;
+    async fn start_connection(
+        connection: Arc<ConnectionInner<impl WebSocketHandler>>,
+    ) -> Result<ActiveSink, TungsteniteError> {
+        let config = connection.handler.lock().websocket_config();
+        let handshake_headers = config.handshake_headers;
+        let url = config.url_prefix + connection.base_url.as_str();
+        let mut request = url.clone().into_client_request()?;
+        for (name, value) in handshake_headers {
+            let name = match tungstenite::http::header::HeaderName::from_bytes(name.as_bytes()) {
+                Ok(name) => name,
+                Err(_) => {
+                    log::warn!("Skipping invalid WebSocket handshake header name: {name}");
+                    continue;
+                }
+            };
+            let value = match tungstenite::http::HeaderValue::from_str(&value) {
+                Ok(value) => value,
+                Err(_) => {
+                    log::warn!(
+                        "Skipping invalid WebSocket handshake header value for {:?}: {value}",
+                        name
+                    );
+                    continue;
+                }
+            };
+            request.headers_mut().insert(name, value);
+        }
+
+        let (websocket_stream, response) = tokio_tungstenite::connect_async(request).await?;
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "WebSocket handshake response: status={} headers={:?}",
+                response.status(),
+                response.headers()
+            );
+        }
+        // 接続が張れた時点の TCP 情報を保存しておく（受信エラー時の特定用）。
+        let (local_addr, peer_addr) = socket_addrs_from_stream(websocket_stream.get_ref());
         let (mut sink, mut stream) = websocket_stream.split();
 
-        let messages = connection.handler.lock().handle_start();
-        for message in messages {
-            sink.send(message.into_message()).await?;
+        // 接続確立直後に送る初期メッセージ（例: subscribe/auth）を handler から受け取る。
+        let start_messages = connection.handler.lock().handle_start();
+        for message in &start_messages {
+            sink.send(message.clone().into_message()).await?;
         }
         sink.flush().await?;
 
         // fetch_not is unstable so we use fetch_xor
-        let id = connection.next_connection_id.fetch_xor(true, Ordering::SeqCst);
+        // 接続ごとに bool をトグルして conn_id として使う（true/false の2値で世代を区別）。
+        let id = connection
+            .next_connection_id
+            .fetch_xor(true, Ordering::SeqCst);
+        let mut attempt_info = ConnectionAttemptInfo {
+            url: url.clone(),
+            local_addr,
+            peer_addr,
+            sent_messages: VecDeque::new(),
+        };
+        // 「この接続で送った」初期メッセージも履歴に積む。
+        for message in &start_messages {
+            attempt_info.record_sent(message);
+        }
+        connection
+            .attempt_info
+            .lock()
+            .insert(id, attempt_info.clone());
+        if log::log_enabled!(log::Level::Debug) {
+            let attempt = connection.attempt_info.lock().get(&id).cloned();
+            if let Some(attempt) = attempt {
+                log::debug!(
+                    "WebSocket connection established; url={} local_addr={:?} peer_addr={:?} conn_id={} sent_messages={:?}",
+                    attempt.url,
+                    attempt.local_addr,
+                    attempt.peer_addr,
+                    id,
+                    attempt.sent_messages_snapshot(),
+                );
+            }
+        }
 
         // pass messages to task_feed_handler
         tokio::spawn(async move {
             while let Some(message) = stream.next().await {
+                if log::log_enabled!(log::Level::Info) {
+                    if let Ok(tungstenite::Message::Close(frame)) = &message {
+                        match frame {
+                            Some(frame) => {
+                                log::info!(
+                                    "WebSocket received close frame: conn_id={} code={:?} reason={}",
+                                    id,
+                                    frame.code,
+                                    frame.reason
+                                );
+                            }
+                            None => {
+                                log::info!(
+                                    "WebSocket received close frame: conn_id={} code=none reason=none",
+                                    id
+                                );
+                            }
+                        }
+                    }
+                }
+                if log::log_enabled!(log::Level::Trace) {
+                    match &message {
+                        Ok(message) => {
+                            let (kind, len) = match message {
+                                tungstenite::Message::Text(text) => ("text", text.len()),
+                                tungstenite::Message::Binary(data) => ("binary", data.len()),
+                                tungstenite::Message::Ping(data) => ("ping", data.len()),
+                                tungstenite::Message::Pong(data) => ("pong", data.len()),
+                                tungstenite::Message::Close(_) => ("close", 0),
+                                tungstenite::Message::Frame(_) => ("frame", 0),
+                            };
+                            log::trace!(
+                                "WebSocket received: conn_id={} kind={} len={}",
+                                id,
+                                kind,
+                                len
+                            );
+                        }
+                        Err(err) => {
+                            log::trace!("WebSocket receive error: conn_id={} err={:?}", id, err);
+                        }
+                    }
+                }
                 // send the received message to the task running feed_handler
-                if connection.message_tx.send((id, FeederMessage::Message(message))).is_err() {
+                if connection
+                    .message_tx
+                    .send((id, FeederMessage::Message(message)))
+                    .is_err()
+                {
                     // the channel is closed. we can't disconnect because we don't have the sink
                     log::debug!("WebSocket message receiver is closed; abandon connection");
                     return;
@@ -322,17 +607,27 @@ impl<H: WebSocketHandler> WebSocketConnection<H> {
             }
             // the underlying WebSocket connection was closed
 
-            drop(connection.message_tx.send((id, FeederMessage::ConnectionClosed))); // this may be Err
+            drop(
+                connection
+                    .message_tx
+                    .send((id, FeederMessage::ConnectionClosed)),
+            ); // this may be Err
             log::debug!("WebSocket stream closed");
         });
-        Ok(sink)
+        Ok(ActiveSink { id, sink })
     }
 
     /// Sends a message to the connection.
     pub async fn send_message(&self, message: WebSocketMessage) -> Result<(), TungsteniteError> {
+        // 外部(API利用側)から send_message() で送るケースもあるので、ここでも送信履歴を更新する。
+        // 送信先の sink と conn_id を同じロックで確定させて、再接続中の取り違えを防ぐ。
         let mut sink_lock = self.sink.lock().await;
-        sink_lock.send(message.into_message()).await?;
-        sink_lock.flush().await
+        let current_id = sink_lock.id;
+        if let Some(attempt) = self.inner.attempt_info.lock().get_mut(&current_id) {
+            attempt.record_sent(&message);
+        }
+        sink_lock.sink.send(message.into_message()).await?;
+        sink_lock.sink.flush().await
     }
 
     /// Returns a [ReconnectState] for this connection.
@@ -348,7 +643,10 @@ impl<H: WebSocketHandler> Drop for WebSocketConnection<H> {
         self.task_reconnect.abort();
         // sending None tells the feeder to close
         let current_id = !self.inner.next_connection_id.load(Ordering::SeqCst);
-        self.inner.message_tx.send((current_id, FeederMessage::DropConnectionRequest)).ok();
+        self.inner
+            .message_tx
+            .send((current_id, FeederMessage::DropConnectionRequest))
+            .ok();
     }
 }
 
@@ -373,7 +671,7 @@ impl ReconnectState {
             inner: Arc::new(ReconnectMangerInner {
                 reconnect_notify: Notify::new(),
                 reconnecting: AtomicBool::new(false),
-            })
+            }),
         }
     }
 
@@ -495,6 +793,11 @@ pub struct WebSocketConfig {
     /// A reconnection will be triggered if no messages are received within this amount of time.
     /// [Default]s to [Duration::ZERO], which means no timeout will be applied.
     pub message_timeout: Duration,
+    /// Additional HTTP headers to include in the WebSocket handshake request.
+    ///
+    /// This is useful for servers that require authentication at handshake time.
+    /// [Default]s to empty.
+    pub handshake_headers: Vec<(String, String)>,
 }
 
 impl WebSocketConfig {
@@ -513,6 +816,7 @@ impl Default for WebSocketConfig {
             ignore_duplicate_during_reconnection: false,
             reconnection_wait: Duration::from_millis(300),
             message_timeout: Duration::ZERO,
+            handshake_headers: Vec::new(),
         }
     }
 }
