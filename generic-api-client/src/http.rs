@@ -181,6 +181,25 @@ impl Client {
     {
         self.request::<&[(&str, &str)], (), H>(Method::DELETE, url, None, None, handler).await
     }
+
+    /// Makes an DELETE request with the given [RequestHandler], with an optional body.
+    ///
+    /// This method just calls [request()][Self::request()]. It requires less typing for type parameters and parameters.
+    ///
+    /// For more information, see [request()][Self::request()].
+    #[inline(always)]
+    pub async fn delete_with_body<B, H>(
+        &self,
+        url: &str,
+        body: Option<B>,
+        handler: &H,
+    ) -> Result<H::Successful, RequestError<H::BuildError, H::Unsuccessful>>
+    where
+        H: RequestHandler<B>,
+    {
+        self.request::<(), B, H>(Method::DELETE, url, None, body, handler)
+            .await
+    }
 }
 
 impl Default for Client {

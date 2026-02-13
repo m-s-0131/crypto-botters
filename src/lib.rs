@@ -172,6 +172,24 @@ impl Client {
         self.client.delete_no_query(url, &O::request_handler(self.merged_options(options))).await
     }
 
+    /// see [http::Client::delete_with_body()]
+    #[inline(always)]
+    pub async fn delete_with_body<'a, R, O, B>(
+        &self,
+        url: &str,
+        body: Option<B>,
+        options: impl IntoIterator<Item = O>,
+    ) -> request_return_type!('a, R, O, B)
+    where
+        O: HttpOption<'a, R, B>,
+        O::RequestHandler: RequestHandler<B>,
+        Self: GetOptions<O::Options>,
+    {
+        self.client
+            .delete_with_body(url, body, &O::request_handler(self.merged_options(options)))
+            .await
+    }
+
     #[inline(always)]
     pub async fn websocket<O, H>(&self, url: &str, handler: H, options: impl IntoIterator<Item=O>) -> Result<WebSocketConnection<O::WebSocketHandler>, TungsteniteError>
     where
